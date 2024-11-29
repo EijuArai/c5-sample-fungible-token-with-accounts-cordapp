@@ -1,0 +1,170 @@
+package com.r3.token.fungible.workflows
+
+import com.r3.accounts.states.AccountInfo
+import com.r3.token.fungible.contracts.TokenContract
+import com.r3.token.fungible.states.Token
+import net.corda.v5.application.flows.*
+import net.corda.v5.application.marshalling.JsonMarshallingService
+import net.corda.v5.application.membership.MemberLookup
+import net.corda.v5.application.messaging.FlowMessaging
+import net.corda.v5.application.messaging.FlowSession
+import net.corda.v5.base.annotations.Suspendable
+import net.corda.v5.base.exceptions.CordaRuntimeException
+import net.corda.v5.ledger.common.NotaryLookup
+import net.corda.v5.ledger.utxo.UtxoLedgerService
+import net.corda.v5.ledger.utxo.token.selection.TokenClaimCriteria
+import net.corda.v5.ledger.utxo.token.selection.TokenSelection
+import org.slf4j.LoggerFactory
+import java.math.BigDecimal
+import java.time.Instant
+import java.time.temporal.ChronoUnit
+
+@InitiatingFlow(protocol = "transfer-token")
+class TransferTokenFlow : ClientStartableFlow {
+    private companion object {
+        val log = LoggerFactory.getLogger(this::class.java.enclosingClass)
+    }
+
+    private data class TransferTokenRequest(
+        val issuerId: String,
+        val newOwnerId: String,
+        val ownerId: String,
+        val symbol: String,
+        val amount: BigDecimal
+    )
+
+    @CordaInject
+    lateinit var flowMessaging: FlowMessaging
+
+    @CordaInject
+    lateinit var jsonMarshallingService: JsonMarshallingService
+
+    @CordaInject
+    lateinit var memberLookup: MemberLookup
+
+    @CordaInject
+    lateinit var notaryLookup: NotaryLookup
+
+    @CordaInject
+    lateinit var utxoLedgerService: UtxoLedgerService
+
+    @CordaInject
+    lateinit var tokenSelection: TokenSelection
+
+    @Suspendable
+    override fun call(requestBody: ClientRequestBody): String {
+        log.info("TransferTokenFlow.call() called")
+
+        val request = requestBody.getRequestBodyAs(jsonMarshallingService, TransferTokenRequest::class.java)
+
+        val notaryInfo = notaryLookup.notaryServices.single()
+
+        val myKey = memberLookup.myInfo().ledgerKeys.first()
+
+        val queryIssuerAccount = utxoLedgerService.query("ACCOUNT_INFO_QUERY", AccountInfo::class.java)
+            .setParameter("identifier", request.issuerId)
+            .setCreatedTimestampLimit(Instant.now())
+        val issuerAccountInfo = queryIssuerAccount.execute().results.singleOrNull() ?: throw CordaRuntimeException("Issuer Account not found.")
+
+        val queryOwnerAccount = utxoLedgerService.query("ACCOUNT_INFO_QUERY", AccountInfo::class.java)
+            .setParameter("identifier", request.ownerId)
+            .setCreatedTimestampLimit(Instant.now())
+        val ownerAccountInfo = queryOwnerAccount.execute().results.single()
+        val ownerKey = ownerAccountInfo.participants.single()
+        val ownerHost = memberLookup.lookup(ownerKey) ?: throw CordaRuntimeException("Owner Host not found.")
+
+        if (ownerHost != memberLookup.myInfo()) {
+            throw CordaRuntimeException("Owner Account should be hosted on initiator node.")
+        }
+
+        val queryNewOwnerAccount = utxoLedgerService.query("ACCOUNT_INFO_QUERY", AccountInfo::class.java)
+            .setParameter("identifier", request.newOwnerId)
+            .setCreatedTimestampLimit(Instant.now())
+        val newOwnerAccountInfo = queryNewOwnerAccount.execute().results.single()
+        val newOwnerKey = newOwnerAccountInfo.participants.single()
+        val newOwnerHost = memberLookup.lookup(newOwnerKey) ?: throw CordaRuntimeException("New Owner Host not found.")
+
+        val criteria = TokenClaimCriteria(
+            Token.tokenType,
+            issuerAccountInfo.accountHash,
+            notaryInfo.name,
+            request.symbol,
+            request.amount
+        ).apply { this.ownerHash = ownerAccountInfo.accountHash }
+        val claim =
+            tokenSelection.tryClaim("transfer", criteria) ?: return jsonMarshallingService.format("Insufficient Token Amount")
+        val spentTokenRefs = claim.claimedTokens.map { it.stateRef }
+        val spentTokenAmount = claim.claimedTokens.sumOf { it.amount }
+
+        val outputs = mutableListOf<Token>()
+        outputs.add(Token(request.symbol, request.amount, newOwnerAccountInfo.identifier.toString(), issuerAccountInfo, newOwnerAccountInfo, listOf(myKey)))
+
+        val changeAmount = spentTokenAmount - request.amount
+        if(changeAmount > BigDecimal(0)){
+            outputs.add(Token(request.symbol, changeAmount, ownerAccountInfo.identifier.toString(), issuerAccountInfo, ownerAccountInfo, listOf(myKey)))
+        }
+
+        val requiredKeys = listOf(myKey, ownerKey).distinct()
+
+        val transaction = utxoLedgerService.createTransactionBuilder()
+            .setNotary(notaryInfo.name)
+            .addInputStates(spentTokenRefs)
+            .addOutputStates(outputs)
+            .addCommand(TokenContract.Transfer())
+            .setTimeWindowUntil(Instant.now().plus(1, ChronoUnit.DAYS))
+            .addSignatories(requiredKeys)
+            .toSignedTransaction()
+
+        val sessions = mutableListOf<FlowSession>()
+
+        if (newOwnerHost != memberLookup.myInfo()) {
+            sessions.add(flowMessaging.initiateFlow(newOwnerHost.name))
+        }
+
+        return try {
+            utxoLedgerService.finalize(transaction, sessions)
+            log.info("Finalization has been finished")
+            "Successfully Transferred ${request.symbol} To ${newOwnerAccountInfo.identifier} From ${ownerAccountInfo.identifier}"
+        } catch (e: Exception) {
+            "Flow failed, message: ${e.message}"
+        }
+    }
+}
+
+@InitiatedBy(protocol = "transfer-token")
+class TransferTokenResponderFlow : ResponderFlow {
+
+    @CordaInject
+    lateinit var utxoLedgerService: UtxoLedgerService
+
+    private companion object {
+        val log = LoggerFactory.getLogger(this::class.java.enclosingClass)
+    }
+
+    @Suspendable
+    override fun call(session: FlowSession) {
+        try {
+            val finalizedSignedTransaction = utxoLedgerService.receiveFinality(session) { ledgerTransaction ->
+                val states = ledgerTransaction.outputContractStates
+                // Check something for SampleToken if you need
+            }
+            log.info("Finished responder flow - $finalizedSignedTransaction")
+        } catch (e: Exception) {
+            log.warn("Exceptionally finished responder flow", e)
+        }
+    }
+}
+
+/*
+{
+  "clientRequestId": "transfer-1",
+  "flowClassName": "com.r3.token.fungible.workflows.TransferTokenFlow",
+  "requestBody": {
+    "issuerId": "df26f856-7437-4b6c-aaa9-3b7bb1810890",
+    "ownerId": "4091a28b-0791-4ef7-bf8c-2befe801e5f8",
+    "newOwnerId": "df26f856-7437-4b6c-aaa9-3b7bb1810890",
+    "symbol": "USD",
+    "amount": 50
+  }
+}
+*/
